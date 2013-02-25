@@ -1,43 +1,33 @@
-#include "WProgram.h"
-#define USB_RAWHID
-#include "usb_rawhid.h"
-#include "nativeSPI.h"
-#include "mk20dx128.h"
+#include "main.h"
 
-#define BUFSIZE 64
-#define PACKETSIZE 2
-#define MAXHEIGHT 480
-#define MAXROTATION 180
-
-#define CMDSTART 64
-#define CMDEND 128
-
-#define STATEIDLE 0
-#define STATEINITIATE 1
-#define STATESCAN 2
-#define STATEEND 3
-
-#define nop asm volatile ("nop\n\t")
-
-byte cmd;
-
-int rotation = 0;
-int height = 0;
-int depth = 1000;
-
-char data_in[BUFSIZE] = {0};
-char data_out[BUFSIZE] = {0};
-
-volatile byte byteBuffer[980];
-volatile int currentByte = 0;
+int rotation = MAXROTATION/2;
+char data[BUFSIZE] = {0};
+//
+//byteBuffer holds the incoming scan data (480 16 bit chunks)
+//inByte counts which byte is currently being added to from the FPGA
+//outByte says what byte is next in line to send
+//data is sent when inByte - outByte >= BUFSIZE
+//
+volatile byte byteBuffer[MAXHEIGHT*2+20];
+volatile int inByte = 0;
 volatile int outByte = 0;
-byte buffer[2];
+volatile byte buffer[2];
 
-void setupSPI(){
-	spiInit(12);
+
+//
+//Clears the PC transmit and recieve data buffer
+//
+void clearDataBuffer(){
+	for(int i=0;i<BUFSIZE;i++){
+		data[i] = 0;
+	}
 }
 
-int checkIncomingCmd(){
+//
+//Checks if there is an incoming command from the PC
+//Return: 1 if there is a command, -1 otherwise
+//
+int checkIncomingCmd() {
 	if(usb_rawhid_available() >= BUFSIZE){
 		return 1;
 	}else{
@@ -46,11 +36,13 @@ int checkIncomingCmd(){
 }
 
 //
-//Return 1 to start scan, 2 to end scan
+//Checks what the command is from the PC
+//Return 1 to start scan, 2 to end scan, -1 for error
 //
-int checkPCCmd(){
-	usb_rawhid_recv(data_in, 15);
-	cmd = data_in[0] >> 6;
+int checkPCCmd() {
+	byte cmd;
+	usb_rawhid_recv(data, 15);
+	cmd = data[0] >> 6;
 	if(cmd == 1){
 		return 1;
 	}else if (cmd == 2){
@@ -59,145 +51,236 @@ int checkPCCmd(){
 	return -1;
 }
 
-void sendPCStart(){
-	data_out[0] = CMDSTART;
-	usb_rawhid_send(data_out, 15);
+//
+//Sends the start scan signal to the PC
+//Also used to confirm starting a scan
+//
+void sendPCStart() {
+	data[0] = CMDSTART;
+	usb_rawhid_send(data, 15);
 }
 
-void sendPCEnd(){
-	data_out[0] = CMDEND;
-	usb_rawhid_send(data_out, 15);
+//
+//Sends the End scan signal to the PC
+//
+void sendPCEnd() {
+	data[0] = CMDEND;
+	usb_rawhid_send(data, 15);
 }
 
-void resetState(){
-	height = 0;
-	rotation = 0;
-	depth = 1000;
-}
-
-//signal the FPGA to take a picture
-void takePicture(){
-	currentByte = 0;
-	outByte = 0;
-	digitalWriteFast(10, LOW);
-	nop; nop;
-	digitalWriteFast(10, HIGH);
-}
-
-//TODO
-//tells the stepper to rotate one step
-//and waits as long as need be before returning
-void rotate(){
-	rotation++;
-}
-
-int packData(){
-	int i;
-	int ending = -1;
-	
-	//Check if the buffer from the FPGA has enough data to fill a packet OR the end packet is recieved
-	//if not then return -1 and do nothing
-	//TODO
-	
-	
-	//Loop over over the size of the data packet and break if the end of the source data is reached
-	for(i=0;i<BUFSIZE/PACKETSIZE;i++){
-		data_out[0+i*PACKETSIZE] = depth >> 8;
-		data_out[1+i*PACKETSIZE] = depth & 255;
-		
-		//data_out[0+i*PACKETSIZE] = byteBuffer[0+outByte];
-		//data_out[1+i*PACKETSIZE] = byteBuffer[1+outByte];
-
-		//outByte += 2;
-		
-		if(ending == 1){return 1;}
-		
-		height++;
-		if(height == MAXHEIGHT){
-			rotate();
-			height = 0;
-			//takePicture();
-		}
-		if(rotation == MAXROTATION){
-			ending = 1;
+//
+//Checks if there is enough data to send and if so transmits it to the PC
+//
+void transmitData(){
+	//if there are at least 64 bytes of unsent data or all inBytes recieved then transmit
+	if(inByte - outByte >= BUFSIZE || inByte == MAXHEIGHT*2){
+		packData();
+		usb_rawhid_send(data, 15);
+		//once done transmitting the data take another picture
+		if(outByte >= MAXHEIGHT*2){
+			rotate(STEP_DIR_RIGHT);
+			takePicture();
 		}
 	}
-	return 1;
 }
 
+//
+//Packs the data from the incoming (from FPGA) buffer into the PC transmission buffer
+//
+void packData() {
+	//Loop over over the size of the data packet and break if the end of the source data is reached
+	for(int i=0;i<BUFSIZE/PACKETSIZE;i++) {
+		data[0+i*PACKETSIZE] = byteBuffer[0+outByte];
+		data[1+i*PACKETSIZE] = byteBuffer[1+outByte];
+		outByte += 2;
+	}
+}
+
+//
+//Resets the scan state for when returning to Idle mode
+//
+void resetState() {
+	rotateStepperOrigin();
+}
+
+//
+//Tells the stepper to rotate one step in the given direction
+//blocks until the stepper has moved
+//
+void rotate(int dir) {
+	//Set the direction and wait for it to set
+	digitalWriteFast(PIN_STEP_DIR, dir);
+	delayMicroseconds(10);
+	//Send the step command pulse
+	digitalWriteFast(PIN_STEP_GO, HIGH);
+	delayMicroseconds(10);
+	digitalWriteFast(PIN_STEP_GO, LOW);
+	//Wait long enough for the stepper to rotate
+	//delay(100); //TEST
+	if(dir){
+		rotation++;
+	}else{
+		rotation--;
+	}
+}
+
+//
+//Rotates the stepper motor back to the origin.
+//Origin is defined as where the stepper pointed at power on
+//
+void rotateStepperOrigin() {
+	if(rotation > MAXROTATION/2){
+		while(rotation > MAXROTATION/2){
+			rotate(STEP_DIR_LEFT);
+			rotation--;
+		}
+	}else{
+		while(rotation < MAXROTATION/2){
+			rotate(STEP_DIR_RIGHT);
+			rotation++;
+		}
+	}
+}
+
+//
+//Rotates the stepper motor to the scan start location (45 degrees left of the origin)
+//
+void rotateStepperStart() {
+	while(rotation > 0){
+		rotate(STEP_DIR_LEFT);
+		rotation--;
+	}
+}
+
+//
+//signal the FPGA to take a picture
+//clears byte counters for the FPGA FIFO
+//
+void takePicture() {
+	inByte = 0;
+	outByte = 0;
+	digitalWriteFast(PIN_SPI_SS, LOW);
+	delayMicroseconds(10);
+	digitalWriteFast(PIN_SPI_SS, HIGH);
+}
+
+//
 //ISR for recieving data from the FPGA
-void recieveValue(){
-	
-	spiRec(buffer, 2);
-	byteBuffer[currentByte] = buffer[0];
-	byteBuffer[currentByte+1] = buffer[1];
-	//byteBuffer[currentByte] = spiRec();
-	currentByte += 2;
+//
+void recieveValue() {
+	buffer[0] = 3; //TEST
+	buffer[1] = 232; //TEST
+
+	//spiRec(buffer, 2); //TEST uncomment for normal operation
+	byteBuffer[inByte] = buffer[0];
+	byteBuffer[inByte+1] = buffer[1];
+	inByte += 2;
 }
 
-extern "C" int main(void)
-{
+//
+//Sets the camera control state
+//
+void initCamera(){
+
+
+
+}
+
+//
+//Sets all control pin input/output and default states
+//does not include any pins related to SPI
+//
+void initControlPins() {
+
+	pinMode(PIN_STEP_DIR, OUTPUT);
+	digitalWriteFast(PIN_STEP_DIR, LOW);
+	
+	pinMode(PIN_STEP_GO, OUTPUT);
+	digitalWriteFast(PIN_STEP_GO, LOW);
+	
+	pinMode(PIN_STEP_SLEEP, OUTPUT);
+	digitalWriteFast(PIN_STEP_SLEEP, STEP_SLEEP);
+	
+	pinMode(PIN_LASER, OUTPUT);
+	digitalWriteFast(PIN_LASER, LASER_OFF);
+}
+
+//
+//Sets the SPI configuration and pin states
+//
+void setupSPI() {
+
+	pinMode(PIN_SPI_CTRL, INPUT);
+	attachInterrupt(PIN_SPI_CTRL, recieveValue, FALLING);
+	
+	pinMode(PIN_SPI_SS, OUTPUT);
+	digitalWriteFast(PIN_SPI_SS, HIGH);
+	
+	spiInit(12);
+}
+
+//
+//Main program control point
+//Handles state management
+//
+extern "C" int main(void) {
 	//state == 0: IDLE wait for scan start signal
 	//state == 1: INITIATE SCAN: reset all data and start new scan
 	//state == 2; scanning... transmitting data
 	//state == 3: scan complete cleanup and reset to state 0
 	int state = STATEIDLE;
 
+	initControlPins();
 	setupSPI();
 	
-	pinMode(9, INPUT);
-	attachInterrupt(9, recieveValue, FALLING);
+	while(1){ //Main loop
+		clearDataBuffer();
 	
-	pinMode(10, OUTPUT);
-	digitalWriteFast(10, HIGH);
-
-	for(int i=0;i<64;i++){
-		data_out[i] = 0;
-	}
-	
-	//Main loop
-	while(1){
 		//IDLE
-		//Wait for command to start scanning
 		if (state == STATEIDLE){
 			if(checkIncomingCmd() == 1){
 				if(checkPCCmd() == 1){
-					sendPCStart();
 					state = STATEINITIATE;
 				}
 			}
+			
 		//INITIATE
 		}else if(state == STATEINITIATE){
 			resetState();
+			rotateStepperStart();
+			sendPCStart();
+			takePicture();
 			state = STATESCAN;
-			//takePicture();
+			
 		//SCANNING
 		}else if (state == STATESCAN){
+		
+			recieveValue();//TEST this normally is by ISR
+		
+			//Check if the PC sent a command to either restart
+			//or cancel the scan
 			if(checkIncomingCmd() == 1){
-				if(checkPCCmd() == 1){
-					sendPCStart();
+				int cmd = checkPCCmd();
+				if(cmd == 1){
 					state = STATEINITIATE;
+				}else if(cmd == 2){
+					state = STATEEND;
 				}
 			}
-			//wait for picture to complete then transmit data
-			//if(currentByte >= MAXHEIGHT){
-				if(packData() == 1){
-					usb_rawhid_send(data_out, 15);
-				}
-				//once done transmitting the data take another picture
-				//if(outByte >= MAXHEIGHT*2){
-				//	takePicture();
-				//}
-			//}
+			//Send any data that we can
+			transmitData();
+			//End the scan if we completed rotating
 			if(rotation == MAXROTATION){
 				state = STATEEND; 
 			}
-		//scan complete cleanup and reset to state 0
+			
+		//SCANEND
 		}else if (state == STATEEND){
 			resetState();
 			sendPCEnd();
 			state = STATEIDLE;
-		}//STATEEND
+		}
+		
 	}//main loop
 }//main
 

@@ -32,6 +32,7 @@ extern "C" int main(void)
 	
 	//Main loop
 	while(1){
+	delayMicroseconds(10);
 		spiSend(buffer, 2);
 		digitalWriteFast(0, state);
 		digitalWriteFast(1, state);
